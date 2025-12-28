@@ -1,0 +1,20 @@
+listen: "127.0.0.1:8080"
+log_level: "info"
+
+state_dir: "/tmp/ai-mux-e2e"
+
+users:
+  - name: "pzany"
+    token: "2hvHyKrTq3gzRouF9dzHpT4ccMB9pMQT"
+
+request_timeout: "60s"
+refresh_check_interval: "10m"
+
+tls:
+  enabled: false
+  cert_path: ""
+  key_path: ""
+
+providers:
+  # - claude
+  - chatgpt
