@@ -321,15 +321,19 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) authenticate(r *http.Request) (string, bool) {
+	// If no users configured, allow all requests (no authentication required)
 	if !s.auth.HasUsers() {
 		return "", true
 	}
+
 	authHeader := r.Header.Get("Authorization")
+
+	// If no Authorization header provided, allow the request (anonymous access)
 	if authHeader == "" {
-		s.logger.Warn("authentication failed: missing authorization", zap.String("remote", r.RemoteAddr))
-		return "", false
+		return "", true
 	}
 
+	// If Authorization header is provided, validate it
 	prefix := "bearer "
 	if len(authHeader) < len(prefix) || !strings.EqualFold(authHeader[:len(prefix)], prefix) {
 		s.logger.Warn("authentication failed: invalid authorization format", zap.String("remote", r.RemoteAddr))
@@ -342,6 +346,7 @@ func (s *Service) authenticate(r *http.Request) (string, bool) {
 		return "", false
 	}
 
+	// Only reject if token is provided but not in user list
 	username, ok := s.auth.Authenticate(token)
 	if !ok {
 		s.logger.Warn("authentication failed: unknown token", zap.String("remote", r.RemoteAddr))

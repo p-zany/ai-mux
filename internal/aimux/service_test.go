@@ -45,18 +45,20 @@ func TestAuthEnforcedWhenUsersConfigured(t *testing.T) {
 	server := newHTTPTestServer(t, service)
 	defer server.Close()
 
+	// Test 1: Request without auth header should be allowed (anonymous access)
 	resp, err := http.Get(server.URL + "/claude/v1/test")
 	if err != nil {
 		t.Fatalf("request without auth: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for anonymous request, got %d", resp.StatusCode)
 	}
-	if atomic.LoadInt32(&upstreamCalls) != 0 {
-		t.Fatalf("upstream should not be called on unauthorized requests")
+	if atomic.LoadInt32(&upstreamCalls) != 1 {
+		t.Fatalf("upstream should be called for anonymous requests, got %d calls", upstreamCalls)
 	}
 
+	// Test 2: Request with valid token should be allowed
 	req, _ := http.NewRequest(http.MethodGet, server.URL+"/claude/v1/test", nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	resp, err = http.DefaultClient.Do(req)
@@ -65,13 +67,91 @@ func TestAuthEnforcedWhenUsersConfigured(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Fatalf("expected 200 for valid token, got %d", resp.StatusCode)
 	}
-	if atomic.LoadInt32(&upstreamCalls) != 1 {
-		t.Fatalf("expected upstream to be called once, got %d", upstreamCalls)
+	if atomic.LoadInt32(&upstreamCalls) != 2 {
+		t.Fatalf("expected upstream to be called twice, got %d", upstreamCalls)
 	}
 	if upstreamAuth != "Bearer upstream-token" {
 		t.Fatalf("upstream should receive refreshed access token, got %q", upstreamAuth)
+	}
+
+	// Test 3: Request with invalid token should be rejected
+	req, _ = http.NewRequest(http.MethodGet, server.URL+"/claude/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer invalid-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request with invalid token: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for invalid token, got %d", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&upstreamCalls) != 2 {
+		t.Fatalf("upstream should not be called for invalid token, got %d calls", upstreamCalls)
+	}
+}
+
+func TestNoAuthRequiredWhenNoUsersConfigured(t *testing.T) {
+	stateDir := writeTempCreds(t, "upstream-token", "refresh-token", time.Now().Add(5*time.Minute).UnixMilli())
+
+	tokenServer := newAnthropicTokenServer(t, "upstream-token", "refresh-token")
+	defer tokenServer.Close()
+
+	var upstreamCalls int32
+	var upstreamAuth string
+	upstream := newHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		upstreamAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := DefaultConfig()
+	cfg.StateDir = stateDir
+	cfg.Users = []User{} // No users configured
+	cfg.Providers = []string{"claude"}
+	cfg.TestClaudeBaseURL = upstream.URL
+	cfg.TestClaudeTokenEndpoint = tokenServer.URL
+	cfg.RequestTimeout = Duration{Duration: 2 * time.Second}
+
+	service, err := NewService(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	server := newHTTPTestServer(t, service)
+	defer server.Close()
+
+	// Test 1: Request without auth header should work
+	resp, err := http.Get(server.URL + "/claude/v1/test")
+	if err != nil {
+		t.Fatalf("request without auth: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for anonymous request (no users), got %d", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&upstreamCalls) != 1 {
+		t.Fatalf("upstream should be called, got %d calls", upstreamCalls)
+	}
+
+	// Test 2: Request with any auth header should also work (ignored)
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/claude/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer some-random-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request with auth header: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 when no users configured (even with auth header), got %d", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&upstreamCalls) != 2 {
+		t.Fatalf("upstream should be called, got %d calls", upstreamCalls)
+	}
+	if upstreamAuth != "Bearer upstream-token" {
+		t.Fatalf("upstream should receive provider's token, got %q", upstreamAuth)
 	}
 }
 
