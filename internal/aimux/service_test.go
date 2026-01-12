@@ -264,22 +264,16 @@ func TestRoutingDispatchesProviders(t *testing.T) {
 	}
 }
 
-func TestHopByHopHeadersAreStrippedAndBetaPreserved(t *testing.T) {
+func TestRequestHopByHopHeadersAreStripped(t *testing.T) {
 	stateDir := writeTempCreds(t, "token-a", "refresh-token", time.Now().Add(5*time.Minute).UnixMilli())
 
 	tokenServer := newAnthropicTokenServer(t, "token-a", "refresh-token")
 	defer tokenServer.Close()
 
-	var sawConnection, sawProxy bool
-	var upstreamAuth, upstreamBeta, upstreamUA, customHeader string
+	var receivedHeaders http.Header
 
 	upstream := newHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawConnection = r.Header.Get("Connection") != ""
-		sawProxy = r.Header.Get("Proxy-Authorization") != "" || r.Header.Get("Proxy-Authenticate") != ""
-		upstreamAuth = r.Header.Get("Authorization")
-		upstreamBeta = r.Header.Get("anthropic-beta")
-		upstreamUA = r.Header.Get("User-Agent")
-		customHeader = r.Header.Get("X-Added")
+		receivedHeaders = r.Header.Clone()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
@@ -290,7 +284,6 @@ func TestHopByHopHeadersAreStrippedAndBetaPreserved(t *testing.T) {
 	cfg.TestClaudeBaseURL = upstream.URL
 	cfg.TestClaudeTokenEndpoint = tokenServer.URL
 	cfg.RequestTimeout = Duration{Duration: 2 * time.Second}
-	cfg.Users = []User{{Name: "bob", Token: "secret"}}
 
 	service, err := NewService(cfg, zap.NewNop())
 	if err != nil {
@@ -300,11 +293,18 @@ func TestHopByHopHeadersAreStrippedAndBetaPreserved(t *testing.T) {
 	defer server.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, server.URL+"/claude/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer secret")
+	// Set hop-by-hop headers that should be stripped
 	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Proxy-Authorization", "anything")
-	req.Header.Set("anthropic-beta", "client-beta")
-	req.Header.Set("User-Agent", "client-agent")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Proxy-Authorization", "Basic xyz")
+	req.Header.Set("Proxy-Authenticate", "Basic")
+	req.Header.Set("Transfer-Encoding", "chunked")
+	req.Header.Set("Te", "trailers")
+	req.Header.Set("Upgrade", "websocket")
+	// Set regular headers that should pass through
+	req.Header.Set("User-Agent", "test-agent")
+	req.Header.Set("X-Custom-Header", "custom-value")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -315,60 +315,60 @@ func TestHopByHopHeadersAreStrippedAndBetaPreserved(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	if sawConnection || sawProxy {
-		t.Fatalf("hop-by-hop headers should be stripped before forwarding")
+	// Verify hop-by-hop headers are NOT forwarded
+	hopByHopHeaders := []string{"Connection", "Keep-Alive", "Proxy-Authorization", "Proxy-Authenticate", "Transfer-Encoding", "Te", "Upgrade"}
+	for _, h := range hopByHopHeaders {
+		if v := receivedHeaders.Get(h); v != "" {
+			t.Errorf("hop-by-hop header %q should be stripped, got %q", h, v)
+		}
 	}
-	if upstreamAuth != "Bearer token-a" {
-		t.Fatalf("expected upstream Authorization to be refreshed token, got %q", upstreamAuth)
+
+	// Verify regular headers ARE forwarded
+	if v := receivedHeaders.Get("User-Agent"); v != "test-agent" {
+		t.Errorf("User-Agent should be forwarded, got %q", v)
 	}
-	if upstreamBeta != "oauth-2025-04-20,client-beta" {
-		t.Fatalf("expected beta header to include default and client value, got %q", upstreamBeta)
+	if v := receivedHeaders.Get("X-Custom-Header"); v != "custom-value" {
+		t.Errorf("X-Custom-Header should be forwarded, got %q", v)
 	}
-	// Custom headers feature removed - client headers should pass through
-	if upstreamUA != "client-agent" {
-		t.Fatalf("expected client user agent to pass through, got %q", upstreamUA)
-	}
-	if customHeader != "" {
-		t.Fatalf("custom headers no longer supported, expected empty, got %q", customHeader)
+	if v := receivedHeaders.Get("Accept"); v != "application/json" {
+		t.Errorf("Accept should be forwarded, got %q", v)
 	}
 }
 
-func TestChatGPTHopByHopHeadersAreStripped(t *testing.T) {
+func TestUpstreamResponseHeadersAreForwardedToClient(t *testing.T) {
 	stateDir := writeTempCreds(t, "token-a", "refresh-token", time.Now().Add(5*time.Minute).UnixMilli())
 
-	anthTokenServer := newAnthropicTokenServer(t, "token-a", "refresh-token")
-	defer anthTokenServer.Close()
-
-	var sawConnection, sawProxy bool
-	var upstreamAuth, upstreamBeta, upstreamUA, customHeader, accountID string
+	tokenServer := newAnthropicTokenServer(t, "token-a", "refresh-token")
+	defer tokenServer.Close()
 
 	upstream := newHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawConnection = r.Header.Get("Connection") != ""
-		sawProxy = r.Header.Get("Proxy-Authorization") != "" || r.Header.Get("Proxy-Authenticate") != ""
-		upstreamAuth = r.Header.Get("Authorization")
-		upstreamBeta = r.Header.Get("anthropic-beta")
-		upstreamUA = r.Header.Get("User-Agent")
-		customHeader = r.Header.Get("X-Added")
-		accountID = r.Header.Get("ChatGPT-Account-Id")
+		// Set custom response headers that should be forwarded
+		w.Header().Set("X-Custom-Header", "custom-value")
+		w.Header().Set("X-Request-Id", "req-12345")
+		w.Header().Set("X-RateLimit-Remaining", "99")
+		w.Header().Add("X-Multi-Value", "value1")
+		w.Header().Add("X-Multi-Value", "value2")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+
+		// Set hop-by-hop headers that should NOT be forwarded
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.Header().Set("Proxy-Authenticate", "Basic")
+		w.Header().Set("Upgrade", "websocket")
+
 		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"status":"ok"}`)
 	}))
 	defer upstream.Close()
 
-	tokenServer := newHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"access_token":"openai-access","refresh_token":"openai-refresh-new","account_id":"acct-123","expires_in":120}`)
-	}))
-	defer tokenServer.Close()
-
 	cfg := DefaultConfig()
 	cfg.StateDir = stateDir
+	cfg.Providers = []string{"claude"}
+	cfg.TestClaudeBaseURL = upstream.URL
+	cfg.TestClaudeTokenEndpoint = tokenServer.URL
 	cfg.RequestTimeout = Duration{Duration: 2 * time.Second}
-	cfg.Users = []User{{Name: "bob", Token: "secret"}}
-	cfg.Providers = []string{"chatgpt"}
-	cfg.TestClaudeTokenEndpoint = anthTokenServer.URL
-	cfg.TestChatGPTBaseURL = upstream.URL
-	cfg.TestChatGPTTokenEndpoint = tokenServer.URL
-	cfg.TestChatGPTRefreshToken = "openai-refresh"
 
 	service, err := NewService(cfg, zap.NewNop())
 	if err != nil {
@@ -377,40 +377,54 @@ func TestChatGPTHopByHopHeadersAreStripped(t *testing.T) {
 	server := newHTTPTestServer(t, service)
 	defer server.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, server.URL+"/chatgpt/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Proxy-Authorization", "anything")
-	req.Header.Set("anthropic-beta", "client-beta")
-	req.Header.Set("User-Agent", "client-agent")
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.Get(server.URL + "/claude/v1/test")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	if sawConnection || sawProxy {
-		t.Fatalf("hop-by-hop headers should be stripped before forwarding")
+	// Verify custom headers are forwarded to client
+	if v := resp.Header.Get("X-Custom-Header"); v != "custom-value" {
+		t.Errorf("X-Custom-Header not forwarded, got %q", v)
 	}
-	if upstreamAuth != "Bearer openai-access" {
-		t.Fatalf("expected upstream Authorization to be refreshed token, got %q", upstreamAuth)
+	if v := resp.Header.Get("X-Request-Id"); v != "req-12345" {
+		t.Errorf("X-Request-Id not forwarded, got %q", v)
 	}
-	if upstreamBeta != "" {
-		t.Fatalf("anthropic-beta should not be forwarded to chatgpt, got %q", upstreamBeta)
+	if v := resp.Header.Get("X-RateLimit-Remaining"); v != "99" {
+		t.Errorf("X-RateLimit-Remaining not forwarded, got %q", v)
 	}
-	// Custom headers feature removed - client headers should pass through
-	if upstreamUA != "client-agent" {
-		t.Fatalf("expected client user agent to pass through, got %q", upstreamUA)
+	if v := resp.Header.Get("Content-Type"); v != "application/json" {
+		t.Errorf("Content-Type not forwarded, got %q", v)
 	}
-	if customHeader != "" {
-		t.Fatalf("custom headers no longer supported, expected empty, got %q", customHeader)
+	if v := resp.Header.Get("Cache-Control"); v != "no-cache" {
+		t.Errorf("Cache-Control not forwarded, got %q", v)
 	}
-	if accountID != "acct-123" {
-		t.Fatalf("expected account id header to be applied, got %q", accountID)
+
+	// Verify multi-value headers are forwarded correctly
+	multiValues := resp.Header.Values("X-Multi-Value")
+	if len(multiValues) != 2 || multiValues[0] != "value1" || multiValues[1] != "value2" {
+		t.Errorf("X-Multi-Value not forwarded correctly, got %v", multiValues)
+	}
+
+	// Verify hop-by-hop headers are NOT forwarded to client
+	if v := resp.Header.Get("Connection"); v != "" {
+		t.Errorf("Connection header should not be forwarded, got %q", v)
+	}
+	if v := resp.Header.Get("Keep-Alive"); v != "" {
+		t.Errorf("Keep-Alive header should not be forwarded, got %q", v)
+	}
+	if v := resp.Header.Get("Transfer-Encoding"); v != "" {
+		t.Errorf("Transfer-Encoding header should not be forwarded, got %q", v)
+	}
+	if v := resp.Header.Get("Proxy-Authenticate"); v != "" {
+		t.Errorf("Proxy-Authenticate header should not be forwarded, got %q", v)
+	}
+	if v := resp.Header.Get("Upgrade"); v != "" {
+		t.Errorf("Upgrade header should not be forwarded, got %q", v)
 	}
 }
 

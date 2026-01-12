@@ -315,6 +315,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.String("path", r.URL.Path),
 			zap.String("upstream_host", upstreamHost),
 			zap.Int("status", resp.StatusCode),
+			zap.Any("headers", sanitizeHeaders(resp.Header)),
 			zap.String("message", body),
 		)
 	}
